@@ -7,7 +7,6 @@ from collections import namedtuple
 from unittest.mock import Mock, call
 from unittest import mock
 
-
 import mlflow
 from mlflow.utils import gorilla
 from mlflow.tracking.client import MlflowClient
@@ -22,6 +21,7 @@ from mlflow.utils.autologging_utils import (
     get_autologging_config,
     autologging_is_disabled,
     get_instance_method_first_arg_value,
+    get_method_call_arg_value,
 )
 from mlflow.utils.autologging_utils.safety import _wrap_patch, AutologgingSession
 from mlflow.utils.autologging_utils.versioning import (
@@ -147,11 +147,8 @@ def test_wrap_patch_with_class():
         orig = gorilla.get_original_attribute(self, "add")
         return 2 * orig(*args, **kwargs)
 
-    before = get_func_attrs(Math.add)
     _wrap_patch(Math, Math.add.__name__, new_add)
-    after = get_func_attrs(Math.add)
 
-    assert after == before
     assert Math().add(1, 2) == 6
 
 
@@ -168,12 +165,8 @@ def test_wrap_patch_with_module():
         """new mlflow.log_param"""
         return a - b
 
-    before_attrs = get_func_attrs(mlflow.log_param)
     assert sample_function_to_patch(10, 5) == 15
-
     _wrap_patch(this_module, sample_function_to_patch.__name__, new_sample_function)
-    after_attrs = get_func_attrs(mlflow.log_param)
-    assert after_attrs == before_attrs
     assert sample_function_to_patch(10, 5) == 5
 
 
@@ -771,9 +764,9 @@ _module_version_info_dict_patch = {
         "package_info": {"pip_release": "mxnet"},
         "autologging": {"minimum": "1.5.1", "maximum": "1.7.0.post1"},
     },
-    "fastai-1.x": {
+    "fastai": {
         "package_info": {"pip_release": "fastai"},
-        "autologging": {"minimum": "1.0.60", "maximum": "1.0.61"},
+        "autologging": {"minimum": "2.4.1", "maximum": "2.4.1"},
     },
     "statsmodels": {
         "package_info": {"pip_release": "statsmodels"},
@@ -789,8 +782,9 @@ _module_version_info_dict_patch = {
 @pytest.mark.parametrize(
     "flavor,module_version,expected_result",
     [
-        ("fastai", "1.0.60", True),
-        ("fastai", "1.0.50", False),
+        ("fastai", "2.4.1", True),
+        ("fastai", "2.3.1", False),
+        ("fastai", "1.0.60", False),
         ("gluon", "1.6.1", True),
         ("gluon", "1.5.0", False),
         ("keras", "2.2.4", True),
@@ -946,3 +940,10 @@ def test_get_instance_method_first_arg_value():
         get_instance_method_first_arg_value(Test.f3, [], {"ab1": 3, "cd2": 4})
     with pytest.raises(AssertionError):
         get_instance_method_first_arg_value(Test.f4, [], {"ab1": 3, "cd2": 4})
+
+
+def test_get_method_call_arg_value():
+    # suppose we call on a method defined like: `def f1(a, b=3, *, c=4, e=5)`
+    assert 2 == get_method_call_arg_value(1, "b", 3, [1, 2], {})
+    assert 3 == get_method_call_arg_value(1, "b", 3, [1], {})
+    assert 2 == get_method_call_arg_value(1, "b", 3, [1], {"b": 2})

@@ -77,6 +77,7 @@ def pytest_ignore_collect(path, config):
             "tests/sagemaker",
             "tests/sklearn",
             "tests/spark",
+            "tests/mleap",
             "tests/tensorflow",
             "tests/azureml",
             "tests/onnx",
@@ -94,6 +95,7 @@ def pytest_ignore_collect(path, config):
             "tests/models",
             "tests/shap",
             "tests/paddle",
+            "tests/prophet",
             "tests/utils/test_model_utils.py",
             # this test is included here because it imports many big libraries like tf, keras, etc
             "tests/tracking/fluent/test_fluent_autolog.py",

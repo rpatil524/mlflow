@@ -37,7 +37,15 @@ class TrackingServiceClient(object):
         :param tracking_uri: Address of local or remote tracking server.
         """
         self.tracking_uri = tracking_uri
-        self.store = utils._get_store(self.tracking_uri)
+        # NB: Fetch the tracking store (`self.store`) upon client initialization to ensure that
+        # the tracking URI is valid and the store can be properly resolved. We define `store` as a
+        # property method to ensure that the client is serializable, even if the store is not
+        # self.store  # pylint: disable=pointless-statement
+        self.store
+
+    @property
+    def store(self):
+        return utils._get_store(self.tracking_uri)
 
     def get_run(self, run_id):
         """
@@ -154,17 +162,24 @@ class TrackingServiceClient(object):
         """
         return self.store.get_experiment_by_name(name)
 
-    def create_experiment(self, name, artifact_location=None):
+    def create_experiment(self, name, artifact_location=None, tags=None):
         """Create an experiment.
 
         :param name: The experiment name. Must be unique.
         :param artifact_location: The location to store run artifacts.
                                   If not provided, the server picks an appropriate default.
+        :param tags: A dictionary of key-value pairs that are converted into
+                                  :py:class:`mlflow.entities.ExperimentTag` objects.
         :return: Integer ID of the created experiment.
         """
         _validate_experiment_name(name)
         _validate_experiment_artifact_location(artifact_location)
-        return self.store.create_experiment(name=name, artifact_location=artifact_location,)
+
+        return self.store.create_experiment(
+            name=name,
+            artifact_location=artifact_location,
+            tags=[ExperimentTag(key, value) for (key, value) in tags.items()] if tags else [],
+        )
 
     def delete_experiment(self, experiment_id):
         """

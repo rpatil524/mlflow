@@ -46,10 +46,8 @@ from mlflow.utils.autologging_utils import (
     safe_patch,
     batch_metrics_logger,
     autologging_integration,
-    ExceptionSafeClass,
 )
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
-
 
 FLAVOR_NAME = "fastai"
 
@@ -67,35 +65,12 @@ def get_default_pip_requirements(include_cloudpickle=False):
     return pip_deps
 
 
-def get_default_conda_env(include_cloudpickle=False):
+def get_default_conda_env(include_cloudpickle=False):  # pylint: disable=unused-argument
     """
-    :return: The default Conda environment as a dictionary for MLflow Models produced by calls to
+    :return: The default Conda environment for MLflow Models produced by calls to
              :func:`save_model()` and :func:`log_model()`.
-
-
-    .. code-block:: python
-        :caption: Example
-
-        import mlflow.fastai
-
-        # Start MLflow session and log the fastai learner model
-        with mlflow.start_run():
-           model.fit(epochs, learning_rate)
-           mlflow.fastai.log_model(model, "model")
-
-        # Fetch the default conda environment
-        env = mlflow.fastai.get_default_conda_env()
-        print("conda environment: {}".format(env))
-
-    .. code-block:: text
-        :caption: Output
-
-        conda environment: {'name': 'mlflow-env',
-                            'channels': ['defaults', 'conda-forge'],
-                            'dependencies': ['python=3.7.5', 'fastai=1.0.61',
-                                             'pip', {'pip': ['mlflow']}]}
     """
-    return _mlflow_conda_env(additional_pip_deps=get_default_pip_requirements(include_cloudpickle))
+    return _mlflow_conda_env(additional_pip_deps=get_default_pip_requirements())
 
 
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name=FLAVOR_NAME))
@@ -115,25 +90,10 @@ def save_model(
 
     :param fastai_learner: fastai Learner to be saved.
     :param path: Local path where the model is to be saved.
-    :param conda_env: Either a dictionary representation of a Conda environment or the path to a
-                      Conda environment yaml file. If provided, this describes the environment
-                      this model should be run in. At minimum, it should specify the
-                      dependencies contained in :func:`get_default_conda_env()`. If
-                      ``None``, the default :func:`get_default_conda_env()` environment is
-                      added to the model. The following is an *example* dictionary
-                      representation of a Conda environment::
-
-                        {
-                            'name': 'mlflow-env',
-                            'channels': ['defaults'],
-                            'dependencies': [
-                                'python=3.7.0',
-                                'fastai=1.0.60',
-                            ]
-                        }
+    :param conda_env: {{ conda_env }}
     :param mlflow_model: MLflow model config this flavor is being added to.
 
-    :param signature: (Experimental) :py:class:`ModelSignature <mlflow.models.ModelSignature>`
+    :param signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>`
                       describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
                       The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
                       from datasets with valid model input (e.g. the training dataset with target
@@ -146,7 +106,7 @@ def save_model(
                         train = df.drop_column("target_label")
                         predictions = ... # compute model predictions
                         signature = infer_signature(train, predictions)
-    :param input_example: (Experimental) Input example provides one or several instances of valid
+    :param input_example: Input example provides one or several instances of valid
                           model input. The example can be used as a hint of what data to feed the
                           model. The given example will be converted to a Pandas DataFrame and then
                           serialized to json using the Pandas split-oriented format. Bytes are
@@ -177,6 +137,7 @@ def save_model(
         results = loaded_model.predict(predict_data)
     """
     import fastai
+    from fastai.callback.all import ParamScheduler
     from pathlib import Path
 
     _validate_env_arguments(conda_env, pip_requirements, extra_pip_requirements)
@@ -196,16 +157,38 @@ def save_model(
     if input_example is not None:
         _save_example(mlflow_model, input_example, path)
 
-    # Save an Learner
+    # ParamScheduler currently is not pickable
+    # hence it is been removed before export and added again after export
+    cbs = [c for c in fastai_learner.cbs if isinstance(c, ParamScheduler)]
+    fastai_learner.remove_cbs(cbs)
     fastai_learner.export(model_data_path, **kwargs)
+    fastai_learner.add_cbs(cbs)
 
-    conda_env, pip_requirements, pip_constraints = (
-        _process_pip_requirements(
-            get_default_pip_requirements(), pip_requirements, extra_pip_requirements,
-        )
-        if conda_env is None
-        else _process_conda_env(conda_env)
+    pyfunc.add_to_model(
+        mlflow_model,
+        loader_module="mlflow.fastai",
+        data=model_data_subpath,
+        env=_CONDA_ENV_FILE_NAME,
     )
+    mlflow_model.add_flavor(FLAVOR_NAME, fastai_version=fastai.__version__, data=model_data_subpath)
+    mlflow_model.save(os.path.join(path, MLMODEL_FILE_NAME))
+
+    if conda_env is None:
+        if pip_requirements is None:
+            default_reqs = get_default_pip_requirements()
+            # To ensure `_load_pyfunc` can successfully load the model during the dependency
+            # inference, `mlflow_model.save` must be called beforehand to save an MLmodel file.
+            inferred_reqs = mlflow.models.infer_pip_requirements(
+                path, FLAVOR_NAME, fallback=default_reqs,
+            )
+            default_reqs = sorted(set(inferred_reqs).union(default_reqs))
+        else:
+            default_reqs = None
+        conda_env, pip_requirements, pip_constraints = _process_pip_requirements(
+            default_reqs, pip_requirements, extra_pip_requirements,
+        )
+    else:
+        conda_env, pip_requirements, pip_constraints = _process_conda_env(conda_env)
 
     with open(os.path.join(path, _CONDA_ENV_FILE_NAME), "w") as f:
         yaml.safe_dump(conda_env, stream=f, default_flow_style=False)
@@ -216,15 +199,6 @@ def save_model(
 
     # Save `requirements.txt`
     write_to(os.path.join(path, _REQUIREMENTS_FILE_NAME), "\n".join(pip_requirements))
-
-    pyfunc.add_to_model(
-        mlflow_model,
-        loader_module="mlflow.fastai",
-        data=model_data_subpath,
-        env=_CONDA_ENV_FILE_NAME,
-    )
-    mlflow_model.add_flavor(FLAVOR_NAME, fastai_version=fastai.__version__, data=model_data_subpath)
-    mlflow_model.save(os.path.join(path, MLMODEL_FILE_NAME))
 
 
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name=FLAVOR_NAME))
@@ -245,28 +219,13 @@ def log_model(
 
     :param fastai_learner: Fastai model (an instance of `fastai.Learner`_) to be saved.
     :param artifact_path: Run-relative artifact path.
-    :param conda_env: Either a dictionary representation of a Conda environment or the path to a
-                      Conda environment yaml file. If provided, this describes the environment
-                      this model should be run in. At minimum, it should specify the dependencies
-                      contained in :func:`get_default_conda_env()`. If ``None``, the default
-                      :func:`get_default_conda_env()` environment is added to the model.
-                      The following is an *example* dictionary representation of a Conda
-                      environment::
-
-                        {
-                            'name': 'mlflow-env',
-                            'channels': ['defaults'],
-                            'dependencies': [
-                                'python=3.7.0',
-                                'fastai=1.0.60',
-                            ]
-                        }
-    :param registered_model_name: Note:: Experimental: This argument may change or be removed in a
+    :param conda_env: {{ conda_env }}
+    :param registered_model_name: This argument may change or be removed in a
                                   future release without warning. If given, create a model
                                   version under ``registered_model_name``, also creating a
                                   registered model if one with the given name does not exist.
 
-    :param signature: (Experimental) :py:class:`ModelSignature <mlflow.models.ModelSignature>`
+    :param signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>`
                       describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
                       The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
                       from datasets with valid model input (e.g. the training dataset with target
@@ -279,7 +238,7 @@ def log_model(
                         train = df.drop_column("target_label")
                         predictions = ... # compute model predictions
                         signature = infer_signature(train, predictions)
-    :param input_example: (Experimental) Input example provides one or several instances of valid
+    :param input_example: Input example provides one or several instances of valid
                           model input. The example can be used as a hint of what data to feed the
                           model. The given example will be converted to a Pandas DataFrame and then
                           serialized to json using the Pandas split-oriented format. Bytes are
@@ -342,11 +301,9 @@ def log_model(
 
 
 def _load_model(path):
-    from fastai.basic_train import load_learner
+    from fastai.learner import load_learner
 
-    abspath = os.path.abspath(path)
-    path, file = os.path.split(abspath)
-    return load_learner(path, file)
+    return load_learner(os.path.abspath(path))
 
 
 class _FastaiModelWrapper:
@@ -354,15 +311,9 @@ class _FastaiModelWrapper:
         self.learner = learner
 
     def predict(self, dataframe):
-        from fastai.tabular import TabularList
-        from fastai.basic_data import DatasetType
-
-        test_data = TabularList.from_df(dataframe, cont_names=self.learner.data.cont_names)
-        self.learner.data.add_test(test_data)
-        preds, target = self.learner.get_preds(DatasetType.Test)
-        preds = pd.Series(map(np.array, preds.numpy()), name="predictions")
-        target = pd.Series(target.numpy(), name="target")
-        return pd.concat([preds, target], axis="columns")
+        dl = self.learner.dls.test_dl(dataframe)
+        preds, _ = self.learner.get_preds(dl=dl)
+        return pd.DataFrame(map(np.array, preds.numpy()), columns=["predictions"])
 
 
 def _load_pyfunc(path):
@@ -431,8 +382,8 @@ def autolog(
     are logged as artifacts to a 'models' directory.
 
     MLflow will also log the parameters of the
-    `EarlyStoppingCallback <https://docs.fast.ai/callbacks.html#EarlyStoppingCallback>`_
-    and `OneCycleScheduler <https://docs.fast.ai/callbacks.html#OneCycleScheduler>`_ callbacks
+    `EarlyStoppingCallback <https://docs.fast.ai/callback.tracker.html#EarlyStoppingCallback>`_
+    and `OneCycleScheduler <https://docs.fast.ai/callback.schedule.html#ParamScheduler>`_ callbacks
 
     :param log_models: If ``True``, trained models are logged as MLflow model artifacts.
                        If ``False``, trained models are not logged.
@@ -514,67 +465,16 @@ def autolog(
 
         Fastai autologged MLflow entities
     """
-    from fastai.basic_train import LearnerCallback, Learner
-    from fastai.callbacks.hooks import model_summary, layers_info
-    from fastai.callbacks import EarlyStoppingCallback, OneCycleScheduler
+    from fastai.learner import Learner
+    from fastai.callback.hook import module_summary, layer_info, find_bs, _print_shapes
+    from fastai.callback.all import EarlyStoppingCallback, TrackerCallback
 
-    def getFastaiCallback(metrics_logger, learner):
-        class __MLflowFastaiCallback(LearnerCallback, metaclass=ExceptionSafeClass):
-            """
-            Callback for auto-logging metrics and parameters.
-            Records model structural information as params when training begins
-            """
+    def getFastaiCallback(metrics_logger, is_fine_tune=False):
+        from mlflow.fastai.callback import __MlflowFastaiCallback
 
-            def __init__(self, learner):
-                super().__init__(learner)
-                self.learner = learner
-                self.opt = self.learn.opt
-                self.metrics_names = ["train_loss", "valid_loss"] + [
-                    o.__name__ for o in learner.metrics
-                ]
-
-            def on_epoch_end(self, **kwargs):
-                """
-                Log loss and other metrics values after each epoch
-                """
-                if kwargs["smooth_loss"] is None or kwargs["last_metrics"] is None:
-                    return
-                epoch = kwargs["epoch"]
-                metrics = [kwargs["smooth_loss"]] + kwargs["last_metrics"]
-                metrics = map(float, metrics)
-                metrics = dict(zip(self.metrics_names, metrics))
-                metrics_logger.record_metrics(metrics, epoch)
-
-            def on_train_begin(self, **kwargs):
-                info = layers_info(self.learner)
-                try_mlflow_log(mlflow.log_param, "num_layers", len(info))
-                try_mlflow_log(mlflow.log_param, "opt_func", self.opt_func.func.__name__)
-
-                if hasattr(self.opt, "true_wd"):
-                    try_mlflow_log(mlflow.log_param, "true_wd", self.opt.true_wd)
-
-                if hasattr(self.opt, "bn_wd"):
-                    try_mlflow_log(mlflow.log_param, "bn_wd", self.opt.bn_wd)
-
-                if hasattr(self.opt, "train_bn"):
-                    try_mlflow_log(mlflow.log_param, "train_bn", self.train_bn)
-
-                summary = model_summary(self.learner)
-
-                tempdir = tempfile.mkdtemp()
-                try:
-                    summary_file = os.path.join(tempdir, "model_summary.txt")
-                    with open(summary_file, "w") as f:
-                        f.write(summary)
-                    try_mlflow_log(mlflow.log_artifact, local_path=summary_file)
-                finally:
-                    shutil.rmtree(tempdir)
-
-            def on_train_end(self, **kwargs):
-                if log_models:
-                    try_mlflow_log(log_model, self.learner, artifact_path="model")
-
-        return __MLflowFastaiCallback(learner)
+        return __MlflowFastaiCallback(
+            metrics_logger=metrics_logger, log_models=log_models, is_fine_tune=is_fine_tune,
+        )
 
     def _find_callback_of_type(callback_type, callbacks):
         for callback in callbacks:
@@ -589,61 +489,88 @@ def autolog(
                     "early_stop_monitor": callback.monitor,
                     "early_stop_min_delta": callback.min_delta,
                     "early_stop_patience": callback.patience,
-                    "early_stop_mode": callback.mode,
+                    "early_stop_comp": callback.comp.__name__,
                 }
                 try_mlflow_log(mlflow.log_params, earlystopping_params)
             except Exception:  # pylint: disable=W0703
                 return
 
-    def _log_one_cycle_callback_params(callback):
-        if callback:
-            try:
-                params = {
-                    "lr_max": callback.lr_max,
-                    "div_factor": callback.div_factor,
-                    "pct_start": callback.pct_start,
-                    "final_div": callback.final_div,
-                    "tot_epochs": callback.tot_epochs,
-                    "start_epoch": callback.start_epoch,
-                    "moms": callback.moms,
-                }
-                try_mlflow_log(mlflow.log_params, params)
-            except Exception:  # pylint: disable=W0703
-                return
+    def _log_model_info(learner):
+        # The process excuted here, are incompatible with TrackerCallback
+        # Hence it is removed and add again after the execution
+        remove_cbs = [cb for cb in learner.cbs if isinstance(cb, TrackerCallback)]
+        if remove_cbs:
+            learner.remove_cbs(remove_cbs)
 
-    def _run_and_log_function(self, original, args, kwargs, unlogged_params, callback_arg_index):
-        log_fn_args_as_params(original, list(args), kwargs, unlogged_params)
+        xb = learner.dls.train.one_batch()[: learner.dls.train.n_inp]
+        infos = layer_info(learner, *xb)
+        bs = find_bs(xb)
+        inp_sz = _print_shapes(map(lambda x: x.shape, xb), bs)
+        try_mlflow_log(mlflow.log_param, "input_size", inp_sz)
+        try_mlflow_log(mlflow.log_param, "num_layers", len(infos))
 
-        callbacks = [cb(self) for cb in self.callback_fns] + (self.callbacks or [])
+        summary = module_summary(learner, *xb)
+
+        # Add again TrackerCallback
+        if remove_cbs:
+            learner.add_cbs(remove_cbs)
+
+        tempdir = tempfile.mkdtemp()
+        try:
+            summary_file = os.path.join(tempdir, "module_summary.txt")
+            with open(summary_file, "w") as f:
+                f.write(summary)
+            try_mlflow_log(mlflow.log_artifact, local_path=summary_file)
+        finally:
+            shutil.rmtree(tempdir)
+
+    def _run_and_log_function(self, original, args, kwargs, unlogged_params, is_fine_tune=False):
+        # Check if is trying to fit while fine tuning or not
+        mlflow_cbs = [cb for cb in self.cbs if cb.name == "___mlflow_fastai"]
+        fit_in_fine_tune = (
+            original.__name__ == "fit" and len(mlflow_cbs) > 0 and mlflow_cbs[0].is_fine_tune
+        )
+
+        if not fit_in_fine_tune:
+            log_fn_args_as_params(original, list(args), kwargs, unlogged_params)
 
         run_id = mlflow.active_run().info.run_id
         with batch_metrics_logger(run_id) as metrics_logger:
-            mlflowFastaiCallback = getFastaiCallback(metrics_logger, self)
 
-            # Checking if the 'callback' argument of the function is set
-            if len(args) > callback_arg_index:
-                tmp_list = list(args)
-                callbacks += list(args[callback_arg_index])
-                tmp_list[callback_arg_index] += [mlflowFastaiCallback]
-                args = tuple(tmp_list)
-            elif kwargs.get("callbacks"):
-                callbacks += list(kwargs["callbacks"])
-                kwargs["callbacks"] += [mlflowFastaiCallback]
-            else:
-                kwargs["callbacks"] = [mlflowFastaiCallback]
+            if not fit_in_fine_tune:
+                early_stop_callback = _find_callback_of_type(EarlyStoppingCallback, self.cbs)
+                _log_early_stop_callback_params(early_stop_callback)
 
-            early_stop_callback = _find_callback_of_type(EarlyStoppingCallback, callbacks)
-            one_cycle_callback = _find_callback_of_type(OneCycleScheduler, callbacks)
+                # First try to remove if any already registered callback
+                self.remove_cbs(mlflow_cbs)
 
-            _log_early_stop_callback_params(early_stop_callback)
-            _log_one_cycle_callback_params(one_cycle_callback)
+                # Log information regarding model and data without bar and print-out
+                with self.no_bar(), self.no_logging():
+                    try_mlflow_log(_log_model_info, learner=self)
+
+                mlflowFastaiCallback = getFastaiCallback(
+                    metrics_logger=metrics_logger, is_fine_tune=is_fine_tune
+                )
+
+                # Add the new callback
+                self.add_cb(mlflowFastaiCallback)
 
             result = original(self, *args, **kwargs)
 
         return result
 
     def fit(original, self, *args, **kwargs):
-        unlogged_params = ["self", "callbacks", "learner"]
-        return _run_and_log_function(self, original, args, kwargs, unlogged_params, 3)
+        unlogged_params = ["self", "cbs", "learner", "lr", "lr_max", "wd"]
+        return _run_and_log_function(
+            self, original, args, kwargs, unlogged_params, is_fine_tune=False
+        )
 
     safe_patch(FLAVOR_NAME, Learner, "fit", fit, manage_run=True)
+
+    def fine_tune(original, self, *args, **kwargs):
+        unlogged_params = ["self", "cbs", "learner", "lr", "lr_max", "wd"]
+        return _run_and_log_function(
+            self, original, args, kwargs, unlogged_params, is_fine_tune=True
+        )
+
+    safe_patch(FLAVOR_NAME, Learner, "fine_tune", fine_tune, manage_run=True)
