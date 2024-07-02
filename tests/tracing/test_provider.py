@@ -1,49 +1,72 @@
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 import pytest
 from opentelemetry import trace
 
 import mlflow
+from mlflow.exceptions import MlflowTracingException
 from mlflow.tracing.export.inference_table import (
     _TRACE_BUFFER,
     InferenceTableSpanExporter,
 )
-from mlflow.tracing.export.mlflow import MlflowSpanExporter
 from mlflow.tracing.fluent import TRACE_BUFFER
 from mlflow.tracing.processor.inference_table import InferenceTableSpanProcessor
-from mlflow.tracing.processor.mlflow import MlflowSpanProcessor
 from mlflow.tracing.provider import (
-    _TRACER_PROVIDER_INITIALIZED,
     _get_tracer,
     _is_enabled,
+    _setup_tracer_provider,
+    reset_tracer_setup,
+    start_span_in_context,
     trace_disabled,
 )
 
 
-# Mock client getter just to count the number of calls
-def test_tracer_provider_singleton():
-    # Reset the Once object as there might be other tests that have already initialized it
-    _TRACER_PROVIDER_INITIALIZED._done = False
-    _get_tracer("module_1")
-    assert _TRACER_PROVIDER_INITIALIZED._done is True
-
-    # Trace provider should be identical for different moments in time
-    tracer_provider_1 = trace.get_tracer_provider()
-    tracer_provider_2 = trace.get_tracer_provider()
-    assert tracer_provider_1 is tracer_provider_2
+@pytest.fixture
+def mock_setup_tracer_provider():
+    # To count the number of times _setup_tracer_provider is called
+    with mock.patch(
+        "mlflow.tracing.provider._setup_tracer_provider", side_effect=_setup_tracer_provider
+    ) as setup_mock:
+        yield setup_mock
 
 
-def test_span_processor_and_exporter_default():
-    _TRACER_PROVIDER_INITIALIZED._done = False
-    tracer = _get_tracer("test")
-    processors = tracer.span_processor._span_processors
-    assert len(processors) == 1
-    assert isinstance(processors[0], MlflowSpanProcessor)
-    assert isinstance(processors[0].span_exporter, MlflowSpanExporter)
+def test_tracer_provider_initialized_once(mock_setup_tracer_provider):
+    assert mock_setup_tracer_provider.call_count == 0
+    start_span_in_context("test1")
+    assert mock_setup_tracer_provider.call_count == 1
+
+    start_span_in_context("test_2")
+    start_span_in_context("test_3")
+    assert mock_setup_tracer_provider.call_count == 1
+
+    # Thread safety
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        executor.map(start_span_in_context, ["test_4", "test_5"])
+    assert mock_setup_tracer_provider.call_count == 1
+
+
+def test_reset_tracer_setup(mock_setup_tracer_provider):
+    assert mock_setup_tracer_provider.call_count == 0
+
+    start_span_in_context("test1")
+    assert mock_setup_tracer_provider.call_count == 1
+
+    reset_tracer_setup()
+    assert mock_setup_tracer_provider.call_count == 2
+
+    start_span_in_context("test2")
+    assert mock_setup_tracer_provider.call_count == 3
+    assert mock_setup_tracer_provider.mock_calls == (
+        [
+            mock.call(),
+            mock.call(disabled=True),
+            mock.call(),
+        ]
+    )
 
 
 def test_span_processor_and_exporter_model_serving(mock_databricks_serving_with_tracing_env):
-    _TRACER_PROVIDER_INITIALIZED._done = False
     tracer = _get_tracer("test")
     processors = tracer.span_processor._span_processors
     assert len(processors) == 1
@@ -72,24 +95,89 @@ def test_disable_enable_tracing():
     assert isinstance(_get_tracer(__name__), trace.Tracer)
     TRACE_BUFFER.clear()
 
+    # enable() / disable() should only raise MlflowTracingException
+    with mock.patch(
+        "mlflow.tracing.provider._is_enabled", side_effect=ValueError("error")
+    ) as is_enabled_mock:
+        with pytest.raises(MlflowTracingException, match="error"):
+            mlflow.tracing.disable()
+        assert is_enabled_mock.call_count == 1
+
+        with pytest.raises(MlflowTracingException, match="error"):
+            mlflow.tracing.enable()
+        assert is_enabled_mock.call_count == 2
+
 
 @pytest.mark.parametrize("enabled_initially", [True, False])
-def test_trace_disabled_context_manager(enabled_initially):
+def test_trace_disabled_decorator(enabled_initially):
     if not enabled_initially:
         mlflow.tracing.disable()
     assert _is_enabled() == enabled_initially
+    call_count = 0
 
-    @mlflow.trace
+    @trace_disabled
     def test_fn():
-        pass
+        with mlflow.start_span(name="test_span") as span:
+            span.set_attribute("key", "value")
+        nonlocal call_count
+        call_count += 1
+        return 0
 
-    with trace_disabled():
-        test_fn()
-        assert len(TRACE_BUFFER) == 0
-        assert not _is_enabled()
+    test_fn()
+    assert len(TRACE_BUFFER) == 0
+    assert call_count == 1
 
     # Recover the initial state
     assert _is_enabled() == enabled_initially
+
+    # Tracing should be enabled back even if the function raises an exception
+    @trace_disabled
+    def test_fn_raise():
+        nonlocal call_count
+        call_count += 1
+        raise ValueError("error")
+
+    with pytest.raises(ValueError, match="error"):
+        test_fn_raise()
+    assert call_count == 2
+
+    assert len(TRACE_BUFFER) == 0
+    assert _is_enabled() == enabled_initially
+
+    # @trace_disabled should not block the decorated function even
+    # if it fails to disable tracing
+    with mock.patch(
+        "mlflow.tracing.provider.disable", side_effect=MlflowTracingException("error")
+    ) as disable_mock:
+        assert test_fn() == 0
+        assert call_count == 3
+        assert disable_mock.call_count == (1 if enabled_initially else 0)
+
+    with mock.patch(
+        "mlflow.tracing.provider.enable", side_effect=MlflowTracingException("error")
+    ) as enable_mock:
+        assert test_fn() == 0
+        assert call_count == 4
+        assert enable_mock.call_count == (1 if enabled_initially else 0)
+
+
+def test_disable_enable_tracing_not_mutate_otel_provider():
+    # This test validates that disable/enable MLflow tracing does not mutate the OpenTelemetry's
+    # global tracer provider instance.
+    otel_tracer_provider = trace.get_tracer_provider()
+
+    mlflow.tracing.disable()
+    assert trace.get_tracer_provider() is otel_tracer_provider
+
+    mlflow.tracing.enable()
+    assert trace.get_tracer_provider() is otel_tracer_provider
+
+    @trace_disabled
+    def test_fn():
+        assert trace.get_tracer_provider() is otel_tracer_provider
+
+    test_fn()
+    assert trace.get_tracer_provider() is otel_tracer_provider
 
 
 def test_is_enabled():
@@ -106,15 +194,23 @@ def test_is_enabled():
 
     # Disable tracing
     mlflow.tracing.disable()
-    assert not _is_enabled()
+    assert _is_enabled() is False
 
     # Try to generate a trace -> tracing is still "off"
     foo()
-    assert not _is_enabled()
+    assert _is_enabled() is False
 
     # Re-enable tracing
     mlflow.tracing.enable()
-    assert _is_enabled()
+    assert _is_enabled() is True
+
+    # _is_enabled() should only raise MlflowTracingException
+    with mock.patch(
+        "mlflow.tracing.provider._get_tracer", side_effect=ValueError("error")
+    ) as get_tracer_mock:
+        with pytest.raises(MlflowTracingException, match="error"):
+            assert _is_enabled() is False
+        assert get_tracer_mock.call_count == 1
 
 
 @pytest.mark.parametrize("enable_mlflow_tracing", [True, False, None])

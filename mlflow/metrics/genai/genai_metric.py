@@ -23,6 +23,7 @@ from mlflow.protos.databricks_pb2 import (
 )
 from mlflow.utils.annotations import experimental
 from mlflow.utils.class_utils import _get_class_from_string
+from mlflow.version import VERSION
 
 _logger = logging.getLogger(__name__)
 
@@ -185,7 +186,7 @@ def make_genai_metric_from_prompt(
     judge_prompt: Optional[str] = None,
     model: Optional[str] = _get_default_model(),
     parameters: Optional[Dict[str, Any]] = None,
-    aggregations: Optional[List[str]] = ["mean", "variance", "p90"],  # noqa: B006
+    aggregations: Optional[List[str]] = None,
     greater_is_better: bool = True,
     max_workers: int = 10,
     metric_metadata: Optional[Dict[str, Any]] = None,
@@ -245,6 +246,23 @@ def make_genai_metric_from_prompt(
         )
 
     """
+    # When users create a custom metric using this function,the metric configuration
+    # will be serialized and stored as an artifact. This enables us to later deserialize
+    # the configuration, allowing users to understand their LLM evaluation results more clearly.
+    genai_metric_args = {
+        "name": name,
+        "judge_prompt": judge_prompt,
+        "model": model,
+        "parameters": parameters,
+        "aggregations": aggregations,
+        "greater_is_better": greater_is_better,
+        "max_workers": max_workers,
+        "metric_metadata": metric_metadata,
+        # Record the mlflow version for serialization in case the function signature changes later
+        "mlflow_version": VERSION,
+    }
+
+    aggregations = aggregations or ["mean", "variance", "p90"]
 
     def eval_fn(
         *args,
@@ -275,6 +293,7 @@ def make_genai_metric_from_prompt(
         greater_is_better=greater_is_better,
         name=name,
         metric_metadata=metric_metadata,
+        genai_metric_args=genai_metric_args,
     )
 
 
@@ -286,10 +305,10 @@ def make_genai_metric(
     examples: Optional[List[EvaluationExample]] = None,
     version: Optional[str] = _get_latest_metric_version(),
     model: Optional[str] = _get_default_model(),
-    grading_context_columns: Optional[Union[str, List[str]]] = [],  # noqa: B006
+    grading_context_columns: Optional[Union[str, List[str]]] = None,
     include_input: bool = True,
     parameters: Optional[Dict[str, Any]] = None,
-    aggregations: Optional[List[str]] = ["mean", "variance", "p90"],  # noqa: B006
+    aggregations: Optional[List[str]] = None,
     greater_is_better: bool = True,
     max_workers: int = 10,
     metric_metadata: Optional[Dict[str, Any]] = None,
@@ -394,6 +413,30 @@ def make_genai_metric(
             greater_is_better=True,
         )
     """
+    # When users create a custom metric using this function,the metric configuration
+    # will be serialized and stored as an artifact. This enables us to later deserialize
+    # the configuration, allowing users to understand their LLM evaluation results more clearly.
+    genai_metric_args = {
+        "name": name,
+        "definition": definition,
+        "grading_prompt": grading_prompt,
+        "examples": examples,
+        "version": version,
+        "model": model,
+        "grading_context_columns": grading_context_columns,
+        "include_input": include_input,
+        "parameters": parameters,
+        "aggregations": aggregations,
+        "greater_is_better": greater_is_better,
+        "max_workers": max_workers,
+        "metric_metadata": metric_metadata,
+        # Record the mlflow version for serialization in case the function signature changes later
+        "mlflow_version": VERSION,
+    }
+
+    aggregations = aggregations or ["mean", "variance", "p90"]
+    grading_context_columns = grading_context_columns or []
+
     if not isinstance(grading_context_columns, list):
         grading_context_columns = [grading_context_columns]
 
@@ -554,4 +597,5 @@ def make_genai_metric(
         version=version,
         metric_details=evaluation_context["eval_prompt"].__str__(),
         metric_metadata=metric_metadata,
+        genai_metric_args=genai_metric_args,
     )

@@ -459,10 +459,6 @@
     "defaultMessage": "There are no evaluable rows within this column",
     "description": "Experiment page > artifact compare view > run column header > Disabled \"Evaluate all\" button tooltip when no rows are evaluable"
   },
-  "7mo4P0": {
-    "defaultMessage": "Notebook",
-    "description": "Experiment page > traces table > notebook column header"
-  },
   "7nAMnb": {
     "defaultMessage": "Please input a name for the new model.",
     "description": "Error message for having no input for creating models in the model registry"
@@ -1010,6 +1006,10 @@
   "JuHp/q": {
     "defaultMessage": "Hugging Face",
     "description": "Experiment dataset drawer > source type > Hugging Face source type label"
+  },
+  "K+5g8S": {
+    "defaultMessage": "Trace data is not available for in-progress traces. Please wait for the trace to complete.",
+    "description": "Experiment page > traces data drawer > in-progress description"
   },
   "K5rmCE": {
     "defaultMessage": "S3",
@@ -1847,6 +1847,10 @@
     "defaultMessage": "Click to hide the run",
     "description": "A tooltip for the \"hide\" icon button in the runs chart tooltip"
   },
+  "eM4+ab": {
+    "defaultMessage": "Source",
+    "description": "Experiment page > traces table > source column header"
+  },
   "eNUbaN": {
     "defaultMessage": "Y-axis:",
     "description": "Label text for y-axis in scatter plot comparison in MLflow"
@@ -1874,10 +1878,6 @@
   "ea5zBl": {
     "defaultMessage": "Run page loading",
     "description": "Run page > Loading state"
-  },
-  "eavoW/": {
-    "defaultMessage": "Error",
-    "description": "Experiment page > traces data drawer > error state title"
   },
   "eeLqSn": {
     "defaultMessage": "Submit",
@@ -2346,6 +2346,10 @@
   "owr9l2": {
     "defaultMessage": "No group by columns selected",
     "description": "Experiment page > artifact compare view > empty state for no group by columns selected > title"
+  },
+  "p0O0uP": {
+    "defaultMessage": "Trace data not available",
+    "description": "Experiment page > traces data drawer > in-progress title"
   },
   "p1H1KR": {
     "defaultMessage": "Last 30 days",

@@ -462,6 +462,7 @@ from mlflow.pyfunc.model import (
     get_default_conda_env,  # noqa: F401
     get_default_pip_requirements,
 )
+from mlflow.tracing.provider import trace_disabled
 from mlflow.tracing.utils import _try_get_prediction_context
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
@@ -921,6 +922,7 @@ def _get_pip_requirements_from_model_path(model_path: str):
     return [req.req_str for req in _parse_requirements(req_file_path, is_constraint=False)]
 
 
+@trace_disabled  # Suppress traces while loading model
 def load_model(
     model_uri: str,
     suppress_warnings: bool = False,
@@ -1136,7 +1138,17 @@ def _load_model_or_server(
     try:
         client.wait_server_ready(timeout=90, scoring_server_proc=scoring_server_proc)
     except Exception as e:
-        raise MlflowException("MLflow model server failed to launch.") from e
+        if scoring_server_proc.poll() is None:
+            # the scoring server is still running but client can't connect to it.
+            # kill the server.
+            scoring_server_proc.kill()
+        server_output, _ = scoring_server_proc.communicate(timeout=15)
+        if isinstance(server_output, bytes):
+            server_output = server_output.decode("UTF-8")
+        raise MlflowException(
+            "MLflow model server failed to launch, server process stdout and stderr are:\n"
+            + server_output
+        ) from e
 
     return _ServedPyFuncModel(
         model_meta=model_meta, client=client, server_pid=scoring_server_proc.pid
@@ -2069,6 +2081,8 @@ Compound types:
                         tempfile.gettempdir(),
                         "mlflow",
                         insecure_hash.sha1(model_uri.encode()).hexdigest(),
+                        # Use pid to avoid conflict when multiple spark UDF tasks
+                        str(os.getpid()),
                     )
                     try:
                         loaded_model = mlflow.pyfunc.load_model(model_path)
@@ -2160,6 +2174,7 @@ def _validate_function_python_model(python_model):
 
 
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name="scikit-learn"))
+@trace_disabled  # Suppress traces for internal predict calls while saving model
 def save_model(
     path,
     loader_module=None,
@@ -2219,7 +2234,9 @@ def save_model(
         python_model:
             An instance of a subclass of :class:`~PythonModel` or a callable object with a single
             argument (see the examples below). The passed-in object is serialized using the
-            CloudPickle library. Any dependencies of the class should be included in one of the
+            CloudPickle library. The python_model can also be a file path to the PythonModel
+            which defines the model from code artifact rather than serializing the model object.
+            Any dependencies of the class should be included in one of the
             following locations:
 
             - The MLflow library.
@@ -2269,6 +2286,35 @@ def save_model(
                 mlflow.pyfunc.save_model("model", python_model=predict, input_example=["a"])
                 model = mlflow.pyfunc.load_model("model")
                 print(model.predict(["a", "b", "c"]))  # -> ["A", "B", "C"]
+
+            Model from code
+
+            .. note::
+                Experimental: Model from code model support is experimental and may change or
+                be removed in a future release without warning.
+
+            .. code-block:: python
+
+                # code.py
+                from typing import List
+                import mlflow
+
+
+                class MyModel(mlflow.pyfunc.PythonModel):
+                    def predict(self, context, model_input: List[str], params=None) -> List[str]:
+                        return [i.upper() for i in model_input]
+
+
+                mlflow.models.set_model(MyModel())
+
+                # log_model.py
+                import mlflow
+
+                with mlflow.start_run():
+                    model_info = mlflow.pyfunc.log_model(
+                        artifact_path="model",
+                        python_model="code.py",
+                    )
 
             If the `predict` method or function has type annotations, MLflow automatically
             constructs a model signature based on the type annotations (unless the ``signature``
@@ -2331,30 +2377,31 @@ def save_model(
     _validate_pyfunc_model_config(model_config)
     _validate_and_prepare_target_save_path(path)
 
-    model_code_path = None
-    if python_model:
-        if isinstance(model_config, Path):
-            model_config = os.fspath(model_config)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        model_code_path = None
+        if python_model:
+            if isinstance(model_config, Path):
+                model_config = os.fspath(model_config)
 
-        if isinstance(model_config, str):
-            model_config = _validate_and_get_model_config_from_file(model_config)
+            if isinstance(model_config, str):
+                model_config = _validate_and_get_model_config_from_file(model_config)
 
-        if isinstance(python_model, Path):
-            python_model = os.fspath(python_model)
+            if isinstance(python_model, Path):
+                python_model = os.fspath(python_model)
 
-        if isinstance(python_model, str):
-            model_code_path = _validate_and_get_model_code_path(python_model)
-            _validate_and_copy_file_to_directory(model_code_path, path, "code")
-            python_model = _load_model_code_path(model_code_path, model_config)
+            if isinstance(python_model, str):
+                model_code_path = _validate_and_get_model_code_path(python_model, temp_dir)
+                _validate_and_copy_file_to_directory(model_code_path, path, "code")
+                python_model = _load_model_code_path(model_code_path, model_config)
 
-        _validate_function_python_model(python_model)
-        if callable(python_model) and all(
-            a is None for a in (input_example, pip_requirements, extra_pip_requirements)
-        ):
-            raise MlflowException(
-                "If `python_model` is a callable object, at least one of `input_example`, "
-                "`pip_requirements`, or `extra_pip_requirements` must be specified."
-            )
+            _validate_function_python_model(python_model)
+            if callable(python_model) and all(
+                a is None for a in (input_example, pip_requirements, extra_pip_requirements)
+            ):
+                raise MlflowException(
+                    "If `python_model` is a callable object, at least one of `input_example`, "
+                    "`pip_requirements`, or `extra_pip_requirements` must be specified."
+                )
 
     mlflow_model = kwargs.pop("model", mlflow_model)
     if len(kwargs) > 0:
@@ -2529,6 +2576,7 @@ def save_model(
 
 
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name="scikit-learn"))
+@trace_disabled  # Suppress traces for internal predict calls while logging model
 def log_model(
     artifact_path,
     loader_module=None,
@@ -2582,7 +2630,9 @@ def log_model(
         python_model:
             An instance of a subclass of :class:`~PythonModel` or a callable object with a single
             argument (see the examples below). The passed-in object is serialized using the
-            CloudPickle library. Any dependencies of the class should be included in one of the
+            CloudPickle library. The python_model can also be a file path to the PythonModel
+            which defines the model from code artifact rather than serializing the model object.
+            Any dependencies of the class should be included in one of the
             following locations:
 
             - The MLflow library.
@@ -2643,6 +2693,35 @@ def log_model(
 
                 loaded_model = mlflow.pyfunc.load_model(model_uri=model_info.model_uri)
                 print(loaded_model.predict(["a", "b", "c"]))  # -> ["A", "B", "C"]
+
+            Model from code
+
+            .. note::
+                Experimental: Model from code model support is experimental and may change or
+                be removed in a future release without warning.
+
+            .. code-block:: python
+
+                # code.py
+                from typing import List
+                import mlflow
+
+
+                class MyModel(mlflow.pyfunc.PythonModel):
+                    def predict(self, context, model_input: List[str], params=None) -> List[str]:
+                        return [i.upper() for i in model_input]
+
+
+                mlflow.models.set_model(MyModel())
+
+                # log_model.py
+                import mlflow
+
+                with mlflow.start_run():
+                    model_info = mlflow.pyfunc.log_model(
+                        artifact_path="model",
+                        python_model="code.py",
+                    )
 
             If the `predict` method or function has type annotations, MLflow automatically
             constructs a model signature based on the type annotations (unless the ``signature``

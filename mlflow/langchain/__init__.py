@@ -18,6 +18,7 @@ import inspect
 import json
 import logging
 import os
+import tempfile
 import warnings
 from typing import Any, Dict, Iterator, List, Optional, Union
 
@@ -28,7 +29,7 @@ from packaging.version import Version
 
 import mlflow
 from mlflow import pyfunc
-from mlflow.environment_variables import _MLFLOW_TESTING, MLFLOW_ENABLE_TRACE_IN_SERVING
+from mlflow.environment_variables import _MLFLOW_TESTING
 from mlflow.exceptions import MlflowException
 from mlflow.langchain._langchain_autolog import (
     _update_langchain_model_config,
@@ -47,7 +48,6 @@ from mlflow.langchain.utils import (
     patch_langchain_type_to_cls_dict,
     register_pydantic_v1_serializer_cm,
 )
-from mlflow.ml_package_versions import _ML_PACKAGE_VERSIONS
 from mlflow.models import Model, ModelInputExample, ModelSignature, get_model_info
 from mlflow.models.dependencies_schemas import (
     _clear_dependencies_schemas,
@@ -63,6 +63,7 @@ from mlflow.models.utils import (
 )
 from mlflow.pyfunc import FLAVOR_NAME as PYFUNC_FLAVOR_NAME
 from mlflow.pyfunc.context import get_prediction_context
+from mlflow.tracing.provider import trace_disabled
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.types.schema import ColSpec, DataType, Schema
@@ -103,8 +104,6 @@ logger = logging.getLogger(mlflow.__name__)
 
 FLAVOR_NAME = "langchain"
 _MODEL_TYPE_KEY = "model_type"
-_MIN_REQ_VERSION = Version(_ML_PACKAGE_VERSIONS["langchain"]["autologging"]["minimum"])
-_MAX_REQ_VERSION = Version(_ML_PACKAGE_VERSIONS["langchain"]["autologging"]["maximum"])
 
 
 def get_default_pip_requirements():
@@ -131,7 +130,7 @@ def get_default_conda_env():
 def _infer_signature_from_input_example_for_lc_model(
     input_example, wrapped_model, example_no_conversion=True
 ):
-    from mlflow.langchain.api_request_parallel_processor import _ChatResponse
+    from mlflow.langchain.utils.chat import _ChatResponse
 
     signature, prediction = _infer_signature_from_input_example(
         input_example, wrapped_model, return_prediction=True, no_conversion=example_no_conversion
@@ -146,6 +145,7 @@ def _infer_signature_from_input_example_for_lc_model(
 
 @experimental
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name=FLAVOR_NAME))
+@trace_disabled  # Suppress traces for internal predict calls while saving model
 def save_model(
     lc_model,
     path,
@@ -171,7 +171,13 @@ def save_model(
             `Chain <https://python.langchain.com/docs/modules/chains/>`_,
             `Agent <https://python.langchain.com/docs/modules/agents/>`_,
             `retriever <https://python.langchain.com/docs/modules/data_connection/retrievers/>`_,
-            or `RunnableSequence <https://python.langchain.com/docs/modules/chains/foundational/sequential_chains#using-lcel>`_.
+            or `RunnableSequence <https://python.langchain.com/docs/modules/chains/foundational/sequential_chains#using-lcel>`_,
+            or a path containing the `LangChain model code <https://github.com/mlflow/mlflow/blob/master/examples/langchain/chain_as_code_driver.py>`
+            for the above types. When using model as path, make sure to set the model
+            by using :func:`mlflow.models.set_model()`.
+
+            .. Note:: Experimental: Using model as path may change or be removed in a future
+                        release without warning.
         path: Local path where the serialized model (as YAML) is to be saved.
         conda_env: {{ conda_env }}
         code_paths: {{ code_paths }}
@@ -257,7 +263,7 @@ def save_model(
                 DataFrame format when saving. This is useful when the model expects a DataFrame
                 input and the input example could be passed directly to the model.
                 Defaults to ``True``.
-        model_config: The model configuration to apply to the model if saving model as code. This
+        model_config: The model configuration to apply to the model if saving model from code. This
             configuration is available during model loading.
 
             .. Note:: Experimental: This parameter may change or be removed in a future
@@ -266,30 +272,31 @@ def save_model(
             True, the model must implement `stream` method. If None, streamable is
             set to True if the model implements `stream` method. Default to `None`.
     """
-    import langchain
-    from langchain.schema import BaseRetriever
+    with tempfile.TemporaryDirectory() as temp_dir:
+        import langchain
+        from langchain.schema import BaseRetriever
 
-    lc_model_or_path = _validate_and_prepare_lc_model_or_path(lc_model, loader_fn)
+        lc_model_or_path = _validate_and_prepare_lc_model_or_path(lc_model, loader_fn, temp_dir)
 
-    _validate_env_arguments(conda_env, pip_requirements, extra_pip_requirements)
+        _validate_env_arguments(conda_env, pip_requirements, extra_pip_requirements)
 
-    path = os.path.abspath(path)
-    _validate_and_prepare_target_save_path(path)
+        path = os.path.abspath(path)
+        _validate_and_prepare_target_save_path(path)
 
-    if isinstance(model_config, str):
-        model_config = _validate_and_get_model_config_from_file(model_config)
+        if isinstance(model_config, str):
+            model_config = _validate_and_get_model_config_from_file(model_config)
 
-    model_code_path = None
-    if isinstance(lc_model_or_path, str):
-        # The LangChain model is defined as Python code located in the file at the path
-        # specified by `lc_model`. Verify that the path exists and, if so, copy it to the
-        # model directory along with any other specified code modules
-        model_code_path = lc_model_or_path
+        model_code_path = None
+        if isinstance(lc_model_or_path, str):
+            # The LangChain model is defined as Python code located in the file at the path
+            # specified by `lc_model`. Verify that the path exists and, if so, copy it to the
+            # model directory along with any other specified code modules
+            model_code_path = lc_model_or_path
 
-        lc_model = _load_model_code_path(model_code_path, model_config)
-        _validate_and_copy_file_to_directory(model_code_path, path, "code")
-    else:
-        lc_model = lc_model_or_path
+            lc_model = _load_model_code_path(model_code_path, model_config)
+            _validate_and_copy_file_to_directory(model_code_path, path, "code")
+        else:
+            lc_model = lc_model_or_path
 
     code_dir_subpath = _validate_and_copy_code_paths(code_paths, path)
 
@@ -415,6 +422,7 @@ def save_model(
 
 @experimental
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name=FLAVOR_NAME))
+@trace_disabled  # Suppress traces for internal predict calls while logging model
 def log_model(
     lc_model,
     artifact_path,
@@ -441,7 +449,13 @@ def log_model(
         lc_model: A LangChain model, which could be a
             `Chain <https://python.langchain.com/docs/modules/chains/>`_,
             `Agent <https://python.langchain.com/docs/modules/agents/>`_, or
-            `retriever <https://python.langchain.com/docs/modules/data_connection/retrievers/>`_.
+            `retriever <https://python.langchain.com/docs/modules/data_connection/retrievers/>`_
+            or a path containing the `LangChain model code <https://github.com/mlflow/mlflow/blob/master/examples/langchain/chain_as_code_driver.py>`
+            for the above types. When using model as path, make sure to set the model
+            by using :func:`mlflow.models.set_model()`.
+
+            .. Note:: Experimental: Using model as path may change or be removed in a future
+                                    release without warning.
         artifact_path: Run-relative artifact path.
         conda_env: {{ conda_env }}
         code_paths: {{ code_paths }}
@@ -539,7 +553,7 @@ def log_model(
         run_id: run_id to associate with this model version. If specified, we resume the
                 run and log the model to that run. Otherwise, a new run is created.
                 Default to None.
-        model_config: The model configuration to apply to the model if saving model as code. This
+        model_config: The model configuration to apply to the model if saving model from code. This
             configuration is available during model loading.
 
             .. Note:: Experimental: This parameter may change or be removed in a future
@@ -552,13 +566,11 @@ def log_model(
         A :py:class:`ModelInfo <mlflow.models.model.ModelInfo>` instance that contains the
         metadata of the logged model.
     """
-    lc_model_or_path = _validate_and_prepare_lc_model_or_path(lc_model, loader_fn)
-
     return Model.log(
         artifact_path=artifact_path,
         flavor=mlflow.langchain,
         registered_model_name=registered_model_name,
-        lc_model=lc_model_or_path,
+        lc_model=lc_model,
         conda_env=conda_env,
         code_paths=code_paths,
         signature=signature,
@@ -640,7 +652,12 @@ class _LangChainModelWrapper:
         # Inference Table in Databricks model serving).
         if (
             is_in_databricks_model_serving_environment()
-            and MLFLOW_ENABLE_TRACE_IN_SERVING.get()
+            # TODO: This env var was once used for controlling whether or not to inject the
+            #   tracer in Databricks model serving. However, now we have the new env var
+            #   `ENABLE_MLFLOW_TRACING` to control that. We don't remove this condition
+            #   right now in the interest of caution, but we should remove this condition
+            #   after making sure that the functionality is stable.
+            and os.environ.get("MLFLOW_ENABLE_TRACE_IN_SERVING", "false").lower() == "true"
             # if this is False, tracing is disabled and we shouldn't inject the tracer
             and is_mlflow_tracing_enabled_in_model_serving()
         ):
@@ -921,6 +938,7 @@ def _load_model_from_local_fs(local_model_path, model_config_overrides=None):
 
 
 @experimental
+@trace_disabled  # Suppress traces while loading model
 def load_model(model_uri, dst_path=None):
     """
     Load a LangChain model from a local file or a run.
@@ -949,10 +967,14 @@ def load_model(model_uri, dst_path=None):
 
 def _patch_runnable_cls(cls):
     """
-    For classes that are subclasses of Runnable, we patch the `invoke`, `batch`, and `stream`
-    methods for autologging.
+    For classes that are subclasses of Runnable, we patch the `invoke`, `batch`, `stream` and
+    `ainvoke`, `abatch`, `astream` methods for autologging.
+
+    Args:
+        cls: The class to patch.
     """
-    for func_name in ["invoke", "batch", "stream"]:
+    patch_functions = ["invoke", "batch", "stream", "ainvoke", "abatch", "astream"]
+    for func_name in patch_functions:
         if hasattr(cls, func_name):
             safe_patch(
                 FLAVOR_NAME,
@@ -990,11 +1012,7 @@ def autolog(
     log_model_signatures=False,
     log_models=False,
     log_datasets=False,
-    # TODO: log_inputs_outputs was originally defaulted to True in the production version of
-    # the LangChain autologging, as it is a common use case to log input/output table for
-    # evaluation. Once tracing is fully launched, this should be supported by the tracer
-    # but we should design it to be compatible with the existing UJ.
-    log_inputs_outputs=False,
+    log_inputs_outputs=None,
     disable=False,
     exclusive=False,
     disable_for_unsupported_versions=True,
@@ -1002,6 +1020,7 @@ def autolog(
     registered_model_name=None,
     extra_tags=None,
     extra_model_classes=None,
+    log_traces=True,
 ):
     """
     Enables (or disables) and configures autologging from Langchain to MLflow.
@@ -1025,7 +1044,11 @@ def autolog(
             are also omitted when ``log_models`` is ``False``.
         log_datasets: If ``True``, dataset information is logged to MLflow Tracking
             if applicable. If ``False``, dataset information is not logged.
-        log_inputs_outputs: If ``True``, inference data and results are combined into a single
+        log_inputs_outputs: **Deprecated** The legacy parameter used for logging inference
+            inputs and outputs. This argument will be removed in a future version of MLflow.
+            The alternative is to use ``log_traces`` which logs traces for Langchain models,
+            including inputs and outputs for each stage.
+            If ``True``, inference data and results are combined into a single
             pandas DataFrame and logged to MLflow Tracking as an artifact.
             If ``False``, inference data and results are not logged.
             Default to ``False``.
@@ -1048,6 +1071,9 @@ def autolog(
             We do not guarantee classes specified in this list can be logged as a model, but tracing
             will be supported. Note that all classes within the list must be subclasses of Runnable,
             and we only patch `invoke`, `batch`, and `stream` methods for tracing.
+        log_traces: If ``True``, traces are logged for Langchain models by using
+            MlflowLangchainTracer as a callback during inference. If ``False``, no traces are
+            collected during inference. Default to ``True``.
     """
     with contextlib.suppress(ImportError):
         import langchain
@@ -1056,14 +1082,6 @@ def autolog(
         from langchain.chains.base import Chain
         from langchain.schema import BaseRetriever
         from langchain.schema.runnable import Runnable
-
-        if not _MIN_REQ_VERSION <= Version(langchain.__version__) <= _MAX_REQ_VERSION:
-            # Suppress the warning after it is shown once
-            warnings.warn(
-                "Autologging is known to be compatible with langchain versions between "
-                f"{_MIN_REQ_VERSION} and {_MAX_REQ_VERSION} and may not succeed with packages "
-                "outside this range."
-            )
 
         # avoid duplicate patching
         patched_classes = set()
